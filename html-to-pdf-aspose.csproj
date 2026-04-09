@@ -9,7 +9,6 @@
 
   <ItemGroup>
     <PackageReference Include="AngleSharp" Version="0.17.1" />
-    <PackageReference Include="AngleSharp.Css" Version="0.17.0" />
     <PackageReference Include="CSharpMath.SkiaSharp" Version="1.0.0-pre.1" />
     <PackageReference Include="SkiaSharp" Version="3.119.2" />
   </ItemGroup>

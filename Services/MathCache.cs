@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Drawing;
 using AngleSharp.Dom;
 using CSharpMath.SkiaSharp;
@@ -7,16 +6,13 @@ using SkiaSharp;
 namespace html_to_pdf_aspose.Services;
 
 /// <summary>
-/// Pre-measures all LaTeX formulas in parallel, caches results for layout + render.
-/// Eliminates duplicate MathPainter creation (was: once in layout, once in render).
+/// Pre-measures all LaTeX formulas, caches measurements + SKPicture for render reuse.
+/// Eliminates duplicate MathPainter creation between layout and render phases.
 /// </summary>
 public class MathCache
 {
     private readonly Dictionary<string, MathMeasurement> _cache = new();
 
-    /// <summary>
-    /// Scan the DOM for all math-tex spans, extract unique LaTeX, measure all in parallel.
-    /// </summary>
     public void PreMeasure(IDocument document, float defaultFontSize)
     {
         var mathSpans = document.QuerySelectorAll("span.math-tex");
@@ -29,8 +25,6 @@ public class MathCache
                 uniqueLatex.Add(latex);
         }
 
-        // Measure all unique formulas sequentially (CSharpMath MathPainter is not thread-safe).
-        // Only measure inline size; display size measured on-demand.
         foreach (var latex in uniqueLatex)
         {
             MeasureAndCache(latex, defaultFontSize, false);
@@ -43,7 +37,6 @@ public class MathCache
         if (_cache.TryGetValue(key, out var cached))
             return cached;
 
-        // Fallback: measure on demand if not pre-cached (different font size)
         return MeasureAndCache(latex, fontSize, isDisplay);
     }
 
@@ -60,34 +53,35 @@ public class MathCache
 
     private static MathMeasurement CreateMeasurement(string latex, float fontSize, bool isDisplay)
     {
-            var painter = new MathPainter
-            {
-                LaTeX = latex,
-                FontSize = fontSize,
-                AntiAlias = true,
-                DisplayErrorInline = false,
-                LineStyle = isDisplay
-                    ? CSharpMath.Atom.LineStyle.Display
-                    : CSharpMath.Atom.LineStyle.Text
-            };
+        var painter = new MathPainter
+        {
+            LaTeX = latex,
+            FontSize = fontSize,
+            TextColor = SKColors.Black,
+            AntiAlias = true,
+            DisplayErrorInline = false,
+            LineStyle = isDisplay
+                ? CSharpMath.Atom.LineStyle.Display
+                : CSharpMath.Atom.LineStyle.Text
+        };
 
-            if (painter.ErrorMessage != null)
-            {
-                return new MathMeasurement
-                {
-                    HasError = true,
-                    ErrorMessage = painter.ErrorMessage
-                };
-            }
-
-            var bounds = painter.Measure();
+        if (painter.ErrorMessage != null)
+        {
             return new MathMeasurement
             {
-                Width = bounds.Width - bounds.X,
-                Height = bounds.Height,
-                BoundsX = bounds.X,
-                BoundsY = bounds.Y
+                HasError = true,
+                ErrorMessage = painter.ErrorMessage
             };
+        }
+
+        var bounds = painter.Measure();
+        return new MathMeasurement
+        {
+            Width = bounds.Width - bounds.X,
+            Height = bounds.Height,
+            BoundsX = bounds.X,
+            BoundsY = bounds.Y
+        };
     }
 
     private static string CacheKey(string latex, float fontSize, bool isDisplay)

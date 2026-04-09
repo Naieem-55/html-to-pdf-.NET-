@@ -2,8 +2,6 @@ using System.Diagnostics;
 using System.Net;
 using System.Text.RegularExpressions;
 using AngleSharp;
-using AngleSharp.Css;
-using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
 using CSharpMath.SkiaSharp;
@@ -27,7 +25,6 @@ public class FreeHtmlToPdfConverter
         var document = ParseHtml(htmlContent).GetAwaiter().GetResult();
         var parseTime = sw.ElapsedMilliseconds;
 
-        // Pre-measure all LaTeX formulas in parallel (uses all CPU cores)
         var mathCache = new MathCache();
         var defaultFontSize = ParseBodyFontSize(document);
         mathCache.PreMeasure(document, defaultFontSize);
@@ -56,18 +53,9 @@ public class FreeHtmlToPdfConverter
         {
             var parts = decl.Split(':', 2, StringSplitOptions.TrimEntries);
             if (parts.Length == 2 && parts[0].Equals("font-size", StringComparison.OrdinalIgnoreCase))
-                return ParseMmOrPx(parts[1], 12f);
+                return LayoutEngine.ParsePxValue(parts[1], 12f);
         }
         return 12f;
-    }
-
-    private static float ParseMmOrPx(string val, float fallback)
-    {
-        val = val.Trim();
-        if (val.EndsWith("mm") && float.TryParse(val[..^2], out var mm)) return mm * 2.83465f;
-        if (val.EndsWith("px") && float.TryParse(val[..^2], out var px)) return px;
-        if (val.EndsWith("pt") && float.TryParse(val[..^2], out var pt)) return pt * 1.333f;
-        return float.TryParse(val, out var v) ? v : fallback;
     }
 
     public byte[] ConvertFromFile(string filePath, PdfPageSettings? settings = null)
@@ -92,14 +80,14 @@ public class FreeHtmlToPdfConverter
 
     private static async Task<IDocument> ParseHtml(string html)
     {
-        var config = Configuration.Default.WithCss();
+        var config = Configuration.Default;
         var context = BrowsingContext.New(config);
         return await context.OpenAsync(req => req.Content(html));
     }
 
     private static async Task<IDocument> ParseUrl(string url)
     {
-        var config = Configuration.Default.WithDefaultLoader().WithCss();
+        var config = Configuration.Default.WithDefaultLoader();
         var context = BrowsingContext.New(config);
         return await context.OpenAsync(url);
     }
@@ -120,36 +108,29 @@ public class FreeHtmlToPdfConverter
     private List<LayoutBox> LayoutDocument(IDocument document, SKSize pageSize, float margin, MathCache mathCache)
     {
         var contentWidth = pageSize.Width - margin * 2;
-        var engine = new LayoutEngine(contentWidth, margin, mathCache);
+        var engine = new LayoutEngine(contentWidth, margin, mathCache, pageSize.Height);
 
         var body = document.Body;
         if (body == null) return engine.Boxes;
 
         engine.LayoutElement(body);
-
-        _logger.LogInformation(
-            "  Layout breakdown: styleResolve={StyleMs}ms ({StyleCount} calls), displayNone={DnMs}ms ({DnCount} calls), mathMeasure={MathMs}ms ({MathCount} formulas), textMeasure={TextMs}ms, fontFallback={FontMs}ms",
-            engine.StyleResolveMs, engine.StyleResolveCount,
-            engine.DisplayNoneMs, engine.DisplayNoneCount,
-            engine.MathMeasureMs, engine.MathCount,
-            engine.TextMeasureMs, engine.FontFallbackMs);
-
         return engine.Boxes;
     }
 
-    // --- PDF Renderer ---
+    // --- PDF Renderer (P0: reuse SKPaint, SKPicture for math, P3: lower DPI) ---
 
     private byte[] RenderToPdf(List<LayoutBox> boxes, SKSize pageSize, float margin, MathCache mathCache)
     {
         using var memStream = new MemoryStream();
         using var wstream = new SKManagedWStream(memStream);
 
+        // P3: Lower DPI/quality for smaller PDF
         var metadata = new SKDocumentPdfMetadata
         {
             Title = "Converted PDF",
             Creation = DateTime.Now,
-            RasterDpi = 300,
-            EncodingQuality = 100
+            RasterDpi = 150,
+            EncodingQuality = 80
         };
 
         using var pdfDoc = SKDocument.CreatePdf(wstream, metadata);
@@ -157,15 +138,35 @@ public class FreeHtmlToPdfConverter
         var contentHeight = pageSize.Height - margin * 2;
         var pages = PaginateBoxes(boxes, contentHeight, margin);
 
+        // P0: Reuse paint objects across all boxes
+        using var bgPaint = new SKPaint { Style = SKPaintStyle.Fill, IsAntialias = true };
+        using var borderPaint = new SKPaint { Style = SKPaintStyle.Stroke, IsAntialias = true };
+        using var textPaint = new SKPaint { IsAntialias = true };
+        using var hrPaint = new SKPaint { Style = SKPaintStyle.Stroke, StrokeWidth = 1, IsAntialias = true };
+
+        long mathDrawMs = 0, textDrawMs = 0;
+        int mathDrawCount = 0, textDrawCount = 0;
+        var swR = new Stopwatch();
+
         foreach (var page in pages)
         {
             using var canvas = pdfDoc.BeginPage(pageSize.Width, pageSize.Height);
             foreach (var box in page)
             {
-                RenderBox(canvas, box, mathCache);
+                if (!string.IsNullOrEmpty(box.LaTeX)) { swR.Restart(); }
+                else if (!string.IsNullOrEmpty(box.Text)) { swR.Restart(); }
+
+                RenderBox(canvas, box, mathCache, bgPaint, borderPaint, textPaint, hrPaint);
+
+                if (!string.IsNullOrEmpty(box.LaTeX)) { mathDrawMs += swR.ElapsedMilliseconds; mathDrawCount++; }
+                else if (!string.IsNullOrEmpty(box.Text)) { textDrawMs += swR.ElapsedMilliseconds; textDrawCount++; }
             }
             pdfDoc.EndPage();
         }
+
+        _logger.LogInformation(
+            "  Render breakdown: mathDraw={MathMs}ms ({MathCount} boxes), textDraw={TextMs}ms ({TextCount} boxes), pages={PageCount}",
+            mathDrawMs, mathDrawCount, textDrawMs, textDrawCount, pages.Count);
 
         pdfDoc.Close();
         wstream.Flush();
@@ -205,43 +206,29 @@ public class FreeHtmlToPdfConverter
         return pages;
     }
 
-    private void RenderBox(SKCanvas canvas, LayoutBox box, MathCache mathCache)
+    private void RenderBox(SKCanvas canvas, LayoutBox box, MathCache mathCache,
+        SKPaint bgPaint, SKPaint borderPaint, SKPaint textPaint, SKPaint hrPaint)
     {
         // Background
         if (box.BackgroundColor != SKColor.Empty && box.BackgroundColor != SKColors.Transparent)
         {
-            using var bgPaint = new SKPaint
-            {
-                Color = box.BackgroundColor,
-                Style = SKPaintStyle.Fill,
-                IsAntialias = true
-            };
+            bgPaint.Color = box.BackgroundColor;
             canvas.DrawRect(box.X, box.Y, box.Width, box.Height, bgPaint);
         }
 
         // Border
         if (box.BorderWidth > 0 && box.BorderColor != SKColor.Empty)
         {
-            using var borderPaint = new SKPaint
-            {
-                Color = box.BorderColor,
-                Style = SKPaintStyle.Stroke,
-                StrokeWidth = box.BorderWidth,
-                IsAntialias = true
-            };
+            borderPaint.Color = box.BorderColor;
+            borderPaint.StrokeWidth = box.BorderWidth;
             canvas.DrawRect(box.X, box.Y, box.Width, box.Height, borderPaint);
         }
 
-        // Text
+        // Text — use pooled font
         if (!string.IsNullOrEmpty(box.Text))
         {
-            var typeface = FontCache.Instance.ResolveForText(box.Text, box.FontFamily ?? "Arial", box.Bold, box.Italic);
-            using var font = new SKFont(typeface, box.FontSize);
-            using var paint = new SKPaint
-            {
-                Color = box.TextColor,
-                IsAntialias = true
-            };
+            var font = FontCache.Instance.GetFontForText(box.Text, box.FontFamily ?? "Arial", box.FontSize, box.Bold, box.Italic);
+            textPaint.Color = box.TextColor;
 
             var textX = box.X;
             if (box.TextAlign == TextAlign.Center)
@@ -255,29 +242,16 @@ public class FreeHtmlToPdfConverter
                 textX = box.X + box.Width - textWidth;
             }
 
-            canvas.DrawText(box.Text, textX, box.Y + box.FontSize, font, paint);
+            canvas.DrawText(box.Text, textX, box.Y + box.FontSize, font, textPaint);
         }
 
-        // LaTeX math
+        // LaTeX math — cached bounds, MathPainter only for draw
         if (!string.IsNullOrEmpty(box.LaTeX))
         {
             var cached = mathCache.Get(box.LaTeX, box.FontSize, box.IsDisplayMath);
 
-            if (cached == null || cached.HasError)
+            if (cached != null && !cached.HasError && cached.Width > 0)
             {
-                // Fallback: render LaTeX source as plain text
-                var fallbackTf = FontCache.Instance.GetTypeface("Arial", false, false);
-                using var fallbackFont = new SKFont(fallbackTf, box.FontSize * 0.8f);
-                using var fallbackPaint = new SKPaint
-                {
-                    Color = box.TextColor,
-                    IsAntialias = true
-                };
-                canvas.DrawText(box.LaTeX, box.X, box.Y + box.FontSize, fallbackFont, fallbackPaint);
-            }
-            else
-            {
-                // Create painter only for drawing (measurement already cached)
                 var painter = new MathPainter
                 {
                     LaTeX = box.LaTeX,
@@ -289,26 +263,24 @@ public class FreeHtmlToPdfConverter
                         ? CSharpMath.Atom.LineStyle.Display
                         : CSharpMath.Atom.LineStyle.Text
                 };
-                var drawY = box.Y + box.FontSize;
-                painter.Draw(canvas, box.X - cached.BoundsX, drawY);
+                painter.Draw(canvas, box.X - cached.BoundsX, box.Y + box.FontSize);
+            }
+            else
+            {
+                var font = FontCache.Instance.GetFont("Arial", box.FontSize * 0.8f, false, false);
+                textPaint.Color = box.TextColor;
+                canvas.DrawText(box.LaTeX, box.X, box.Y + box.FontSize, font, textPaint);
             }
         }
 
         // Horizontal rule
         if (box.IsHr)
         {
-            using var hrPaint = new SKPaint
-            {
-                Color = box.BorderColor != SKColor.Empty ? box.BorderColor : new SKColor(200, 200, 200),
-                Style = SKPaintStyle.Stroke,
-                StrokeWidth = 1,
-                IsAntialias = true
-            };
+            hrPaint.Color = box.BorderColor != SKColor.Empty ? box.BorderColor : new SKColor(200, 200, 200);
             var hrY = box.Y + box.Height / 2;
             canvas.DrawLine(box.X, hrY, box.X + box.Width, hrY, hrPaint);
         }
     }
-
 }
 
 // --- Layout Box Record ---
@@ -336,44 +308,44 @@ public record LayoutBox
 
 public enum TextAlign { Left, Center, Right }
 
-// --- Layout Engine ---
+// --- Layout Engine (with float, inline-block, page-break, margin collapsing) ---
 
 public class LayoutEngine
 {
-    private readonly float _contentWidth;
-    private readonly float _marginLeft;
+    private float _contentWidth;
+    private float _marginLeft;
+    private readonly float _pageHeight;
     private float _cursorY;
 
     public List<LayoutBox> Boxes { get; } = new();
 
-    // Inline accumulation state
+    // Inline state
     private float _inlineX;
     private bool _inInline;
     private float _inlineMaxHeight;
 
-    // Inherited style state
-    private readonly Stack<InheritedStyle> _styleStack = new();
+    // Float state (P0 accuracy: CSS float layout)
+    private float _floatX;
+    private float _floatRowY;
+    private bool _inFloatRow;
 
-    // Math cache (pre-measured in parallel)
+    // Margin collapsing (P4 accuracy)
+    private float _lastMarginBottom;
+
+    private readonly Stack<InheritedStyle> _styleStack = new();
     private readonly MathCache _mathCache;
 
-    // Timing counters
-    public long MathMeasureMs { get; private set; }
-    public long StyleResolveMs { get; private set; }
-    public long FontFallbackMs { get; private set; }
-    public long TextMeasureMs { get; private set; }
-    public long DisplayNoneMs { get; private set; }
-    public int MathCount { get; private set; }
-    public int FontFallbackCount { get; private set; }
-    public int StyleResolveCount { get; private set; }
-    public int DisplayNoneCount { get; private set; }
+    // Compiled regex
+    private static readonly Regex WhitespaceRegex = new(@"\s+", RegexOptions.Compiled);
 
-    public LayoutEngine(float contentWidth, float marginLeft, MathCache mathCache)
+    public LayoutEngine(float contentWidth, float marginLeft, MathCache mathCache, float pageHeight)
     {
         _contentWidth = contentWidth;
         _marginLeft = marginLeft;
         _cursorY = marginLeft;
         _inlineX = marginLeft;
+        _floatX = marginLeft;
+        _pageHeight = pageHeight;
         _mathCache = mathCache;
         _styleStack.Push(new InheritedStyle());
     }
@@ -382,17 +354,23 @@ public class LayoutEngine
     {
         var tagName = element.TagName.ToUpperInvariant();
 
-        // Skip invisible elements — no style computation needed
         if (tagName is "SCRIPT" or "STYLE" or "META" or "LINK" or "HEAD" or "TITLE" or "NOSCRIPT")
             return;
 
-        var swStyle = Stopwatch.StartNew();
         var style = ResolveStyle(element);
-        StyleResolveMs += swStyle.ElapsedMilliseconds;
-        StyleResolveCount++;
 
         if (style.IsHidden)
             return;
+
+        // P3 accuracy: page-break-before
+        if (style.PageBreakBefore)
+        {
+            FlushInline();
+            FlushFloatRow();
+            var contentHeight = _pageHeight - _marginLeft * 2;
+            var currentPage = (int)((_cursorY - _marginLeft) / contentHeight);
+            _cursorY = _marginLeft + (currentPage + 1) * (contentHeight + _marginLeft * 2);
+        }
 
         _styleStack.Push(style);
 
@@ -401,9 +379,31 @@ public class LayoutEngine
         {
             var latex = ExtractLatex(element.TextContent);
             if (!string.IsNullOrWhiteSpace(latex))
-            {
                 EmitInlineMath(latex, style);
-            }
+            _styleStack.Pop();
+            return;
+        }
+
+        // P0 accuracy: CSS clear:both
+        if (style.ClearBoth)
+        {
+            FlushInline();
+            FlushFloatRow();
+        }
+
+        // P0 accuracy: CSS float:left with width
+        if (style.FloatLeft && style.WidthPercent > 0)
+        {
+            FlushInline();
+            LayoutFloatedElement(element, style);
+            _styleStack.Pop();
+            return;
+        }
+
+        // P1 accuracy: display:inline-block with width
+        if (style.DisplayInlineBlock && style.WidthPercent > 0)
+        {
+            LayoutInlineBlockElement(element, style);
             _styleStack.Pop();
             return;
         }
@@ -438,8 +438,7 @@ public class LayoutEngine
                 break;
 
             case "IMG":
-                var alt = element.GetAttribute("alt") ?? "[image]";
-                EmitPlainText($"[{alt}]", style);
+                EmitPlainText($"[{element.GetAttribute("alt") ?? "image"}]", style);
                 break;
 
             case "TABLE":
@@ -467,6 +466,107 @@ public class LayoutEngine
         _styleStack.Pop();
     }
 
+    // --- Float layout (P0 accuracy) ---
+
+    private void LayoutFloatedElement(IElement element, InheritedStyle style)
+    {
+        var floatWidth = _contentWidth * style.WidthPercent / 100f;
+
+        if (!_inFloatRow)
+        {
+            _floatX = _marginLeft;
+            _floatRowY = _cursorY;
+            _inFloatRow = true;
+        }
+
+        // Save state, layout children within the float column
+        var savedX = _inlineX;
+        var savedCursorY = _cursorY;
+        var savedContentWidth = _contentWidth;
+
+        _cursorY = _floatRowY;
+        _inlineX = _floatX;
+
+        // Temporarily narrow content width for child layout
+        var savedMarginLeft = _marginLeft;
+        SetContentContext(_floatX, floatWidth);
+
+        _styleStack.Push(style);
+        ProcessChildNodes(element, style);
+        FlushInline();
+        _styleStack.Pop();
+
+        var floatBottom = _cursorY;
+
+        // Restore and advance float X
+        SetContentContext(savedMarginLeft, savedContentWidth);
+        _floatX += floatWidth;
+        _cursorY = Math.Max(savedCursorY, floatBottom);
+    }
+
+    private void FlushFloatRow()
+    {
+        if (_inFloatRow)
+        {
+            _floatX = _marginLeft;
+            _inFloatRow = false;
+        }
+    }
+
+    private void SetContentContext(float marginLeft, float contentWidth)
+    {
+        _marginLeft = marginLeft;
+        _contentWidth = contentWidth;
+    }
+
+    // --- Inline-block layout (P1 accuracy) ---
+
+    private float _inlineBlockX;
+    private float _inlineBlockRowY;
+    private float _inlineBlockRowMaxHeight;
+
+    private void LayoutInlineBlockElement(IElement element, InheritedStyle style)
+    {
+        var blockWidth = _contentWidth * style.WidthPercent / 100f;
+        var rightEdge = _marginLeft + _contentWidth;
+
+        // Wrap to next row if needed
+        if (_inlineBlockX + blockWidth > rightEdge + 1f)
+        {
+            _cursorY = _inlineBlockRowY + _inlineBlockRowMaxHeight;
+            _inlineBlockX = _marginLeft;
+            _inlineBlockRowMaxHeight = 0;
+        }
+
+        if (_inlineBlockX <= _marginLeft)
+        {
+            _inlineBlockRowY = _cursorY;
+            _inlineBlockX = _marginLeft;
+            _inlineBlockRowMaxHeight = 0;
+        }
+
+        // Layout children within the inline-block
+        var savedCursorY = _cursorY;
+        _cursorY = _inlineBlockRowY;
+        _inlineX = _inlineBlockX;
+
+        var savedMarginLeft = _marginLeft;
+        var savedContentWidth = _contentWidth;
+        SetContentContext(_inlineBlockX, blockWidth);
+
+        _styleStack.Push(style);
+        ProcessChildNodes(element, style);
+        FlushInline();
+        _styleStack.Pop();
+
+        var blockHeight = _cursorY - _inlineBlockRowY;
+        _inlineBlockRowMaxHeight = Math.Max(_inlineBlockRowMaxHeight, blockHeight);
+
+        SetContentContext(savedMarginLeft, savedContentWidth);
+        _inlineBlockX += blockWidth;
+        _cursorY = Math.Max(savedCursorY, _inlineBlockRowY + _inlineBlockRowMaxHeight);
+    }
+
     private void ProcessChildNodes(IElement element, InheritedStyle style)
     {
         foreach (var child in element.ChildNodes)
@@ -475,9 +575,7 @@ public class LayoutEngine
             {
                 var text = NormalizeWhitespace(textNode.Data);
                 if (!string.IsNullOrEmpty(text))
-                {
                     EmitTextWithLatex(text, style);
-                }
             }
             else if (child is IElement childElement)
             {
@@ -486,7 +584,7 @@ public class LayoutEngine
         }
     }
 
-    // --- LaTeX Detection ---
+    // --- LaTeX ---
 
     private static bool IsMathTexElement(IElement element)
     {
@@ -511,39 +609,20 @@ public class LayoutEngine
         return text.Trim();
     }
 
-    // Convert unsupported LaTeX commands to CSharpMath-compatible equivalents
     private static readonly Regex UndersetLimRegex = new(
-        @"\\underset\{([^}]*)\}\{\\?lim\}",
-        RegexOptions.Compiled);
-
+        @"\\underset\{([^}]*)\}\{\\?lim\}", RegexOptions.Compiled);
     private static readonly Regex UndersetRegex = new(
-        @"\\underset\{([^}]*)\}\{([^}]*)\}",
-        RegexOptions.Compiled);
-
+        @"\\underset\{([^}]*)\}\{([^}]*)\}", RegexOptions.Compiled);
     private static readonly Regex OversetRegex = new(
-        @"\\overset\{([^}]*)\}\{([^}]*)\}",
-        RegexOptions.Compiled);
+        @"\\overset\{([^}]*)\}\{([^}]*)\}", RegexOptions.Compiled);
 
     internal static string SanitizeLatex(string latex)
     {
-        // \underset{x\rightarrow0}{lim} -> \lim_{x\rightarrow0}
         latex = UndersetLimRegex.Replace(latex, @"\lim_{$1}");
-
-        // \underset{...}{X} -> X_{...}
         latex = UndersetRegex.Replace(latex, @"{$2}_{$1}");
-
-        // \overset{...}{X} -> X^{...}
         latex = OversetRegex.Replace(latex, @"{$2}^{$1}");
-
-        // \operatorname{...} -> \mathrm{...}
         latex = latex.Replace("\\operatorname", "\\mathrm");
-
-        // \displaystyle -> (just remove, CSharpMath uses LineStyle instead)
         latex = latex.Replace("\\displaystyle", "");
-
-        // \text{} -> \mathrm{}  (CSharpMath supports \text in some contexts)
-        // Keep \text as-is since CSharpMath may handle it
-
         return latex;
     }
 
@@ -554,11 +633,9 @@ public class LayoutEngine
     private void EmitTextWithLatex(string text, InheritedStyle style)
     {
         var segments = LatexPattern.Split(text);
-
         foreach (var segment in segments)
         {
             if (string.IsNullOrEmpty(segment)) continue;
-
             if (LatexPattern.IsMatch(segment))
             {
                 var latex = ExtractLatex(segment);
@@ -574,7 +651,7 @@ public class LayoutEngine
         }
     }
 
-    // --- Text Emission with Font Fallback ---
+    // --- Text ---
 
     private void EmitPlainText(string text, InheritedStyle style)
     {
@@ -591,19 +668,14 @@ public class LayoutEngine
             _inlineMaxHeight = 0;
         }
 
-        // Resolve typeface once for the whole text run (check first non-ASCII char)
-        var swText = Stopwatch.StartNew();
-        var typeface = FontCache.Instance.ResolveForText(text, style.FontFamily, style.Bold, style.Italic);
-        var resolvedFamily = typeface.FamilyName;
-        using var font = new SKFont(typeface, style.FontSize);
+        var font = FontCache.Instance.GetFontForText(text, style.FontFamily, style.FontSize, style.Bold, style.Italic);
+        var resolvedFamily = font.Typeface.FamilyName;
         var spaceWidth = font.MeasureText(" ");
-        TextMeasureMs += swText.ElapsedMilliseconds;
 
         foreach (var word in words)
         {
             var wordWidth = font.MeasureText(word);
 
-            // Word wrap
             if (_inlineX + wordWidth > rightEdge && _inlineX > _marginLeft + style.PaddingLeft)
             {
                 _cursorY += Math.Max(lineHeight, _inlineMaxHeight);
@@ -632,14 +704,11 @@ public class LayoutEngine
         }
     }
 
-    // --- Math Emission ---
+    // --- Math ---
 
     private void EmitInlineMath(string latex, InheritedStyle style)
     {
-        var swMath = Stopwatch.StartNew();
         var cached = _mathCache.Get(latex, style.FontSize, false);
-        MathMeasureMs += swMath.ElapsedMilliseconds;
-        MathCount++;
 
         if (cached == null || cached.HasError || cached.Width <= 0)
         {
@@ -699,7 +768,6 @@ public class LayoutEngine
         var mathHeight = Math.Max(cached.Height, displayFontSize * 1.5f);
 
         _cursorY += 6;
-
         var centerX = _marginLeft + (_contentWidth - mathWidth) / 2;
 
         Boxes.Add(new LayoutBox
@@ -762,22 +830,15 @@ public class LayoutEngine
                 {
                     Boxes.Add(new LayoutBox
                     {
-                        X = cellX,
-                        Y = _cursorY,
-                        Width = colWidth,
-                        Height = rowHeight,
+                        X = cellX, Y = _cursorY, Width = colWidth, Height = rowHeight,
                         BackgroundColor = bgColor
                     });
                 }
 
                 Boxes.Add(new LayoutBox
                 {
-                    X = cellX,
-                    Y = _cursorY,
-                    Width = colWidth,
-                    Height = rowHeight,
-                    BorderColor = new SKColor(189, 195, 199),
-                    BorderWidth = 0.5f
+                    X = cellX, Y = _cursorY, Width = colWidth, Height = rowHeight,
+                    BorderColor = new SKColor(189, 195, 199), BorderWidth = 0.5f
                 });
 
                 var text = cell.TextContent.Trim();
@@ -788,10 +849,8 @@ public class LayoutEngine
                     {
                         X = cellX + 5,
                         Y = _cursorY + (rowHeight - fontSize) / 2,
-                        Width = colWidth - 10,
-                        Height = fontSize,
-                        Text = text,
-                        FontSize = fontSize,
+                        Width = colWidth - 10, Height = fontSize,
+                        Text = text, FontSize = fontSize,
                         FontFamily = cellStyle.FontFamily,
                         Bold = isHeader || cellStyle.Bold,
                         Italic = cellStyle.Italic,
@@ -800,10 +859,8 @@ public class LayoutEngine
                     });
                 }
             }
-
             _cursorY += rowHeight;
         }
-
         _cursorY += 4;
     }
 
@@ -821,21 +878,15 @@ public class LayoutEngine
             counter++;
 
             var style = ResolveStyle(item);
-
-            var typeface = FontCache.Instance.ResolveForText(bullet, style.FontFamily, style.Bold, style.Italic);
-            using var font = new SKFont(typeface, style.FontSize);
+            var font = FontCache.Instance.GetFont(style.FontFamily, style.FontSize, style.Bold, style.Italic);
             var bulletWidth = font.MeasureText(bullet);
 
             Boxes.Add(new LayoutBox
             {
-                X = _marginLeft + indent,
-                Y = _cursorY,
-                Width = bulletWidth,
-                Height = style.FontSize * style.LineHeight,
-                Text = bullet,
-                FontSize = style.FontSize,
-                FontFamily = style.FontFamily,
-                TextColor = style.TextColor
+                X = _marginLeft + indent, Y = _cursorY,
+                Width = bulletWidth, Height = style.FontSize * style.LineHeight,
+                Text = bullet, FontSize = style.FontSize,
+                FontFamily = style.FontFamily, TextColor = style.TextColor
             });
 
             _inlineX = _marginLeft + indent + bulletWidth;
@@ -851,35 +902,14 @@ public class LayoutEngine
 
     // --- Style Resolution ---
 
-    // Cache: skip GetComputedStyle for elements with no styling
-    private IWindow? _cachedWindow;
-    private bool _windowResolved;
-
-    private ICssStyleDeclaration? GetComputedStyleCached(IElement element)
-    {
-        // Only call GetComputedStyle if element has style attr, classes, or is styled by tag
-        if (!_windowResolved)
-        {
-            _cachedWindow = element.Owner?.DefaultView;
-            _windowResolved = true;
-        }
-        if (_cachedWindow == null) return null;
-
-        try
-        {
-            return _cachedWindow.GetComputedStyle(element);
-        }
-        catch { return null; }
-    }
-
     private InheritedStyle ResolveStyle(IElement element)
     {
         var parent = _styleStack.Peek();
-        var style = parent with { };
+        var style = parent with { FloatLeft = false, ClearBoth = false, DisplayInlineBlock = false,
+                                   WidthPercent = 0, PageBreakBefore = false };
 
         var tagName = element.TagName.ToUpperInvariant();
 
-        // Apply tag defaults (no GetComputedStyle needed)
         style = tagName switch
         {
             "H1" => style with { FontSize = 28, Bold = true, MarginTop = 16, MarginBottom = 10 },
@@ -896,38 +926,25 @@ public class LayoutEngine
             _ => style
         };
 
-        // Fast path: parse inline style attribute directly instead of GetComputedStyle
         var inlineStyle = element.GetAttribute("style");
         if (!string.IsNullOrEmpty(inlineStyle))
-        {
             style = ApplyInlineStyle(style, inlineStyle);
-        }
 
-        // Only use GetComputedStyle for the <body> tag (to pick up body-level font-size)
-        // Skip for all other elements — inline styles + tag defaults cover visual properties.
-        // The HTML's CSS classes mostly set layout props (float, width, overflow) we don't use.
-        if (tagName == "BODY")
-        {
-            var computed = GetComputedStyleCached(element);
-            if (computed != null)
-            {
-                style = ApplyComputedStyle(style, computed);
-            }
-        }
+        // Body font-size handled by ParseBodyFontSize + inline style parser.
+        // No GetComputedStyle needed — allows dropping AngleSharp.Css dependency.
 
         return style;
     }
 
     private static InheritedStyle ApplyInlineStyle(InheritedStyle style, string inlineStyle)
     {
-        // Fast inline style parser — avoids GetComputedStyle entirely
         foreach (var declaration in inlineStyle.Split(';', StringSplitOptions.RemoveEmptyEntries))
         {
             var parts = declaration.Split(':', 2, StringSplitOptions.TrimEntries);
             if (parts.Length != 2) continue;
 
             var prop = parts[0].ToLowerInvariant();
-            var val = parts[1];
+            var val = parts[1].Trim();
 
             style = prop switch
             {
@@ -951,6 +968,19 @@ public class LayoutEngine
                 "padding-bottom" => style with { PaddingBottom = ParsePxValue(val, style.PaddingBottom) },
                 "padding-left" => style with { PaddingLeft = ParsePxValue(val, style.PaddingLeft) },
                 "display" when val == "none" => style with { IsHidden = true },
+                // P1 accuracy: inline-block
+                "display" when val == "inline-block" => style with { DisplayInlineBlock = true },
+                // P0 accuracy: float
+                "float" when val == "left" => style with { FloatLeft = true },
+                // P0 accuracy: clear
+                "clear" when val == "both" => style with { ClearBoth = true },
+                // P2 accuracy: width %
+                "width" when val.EndsWith('%') => style with
+                {
+                    WidthPercent = float.TryParse(val[..^1], out var wp) ? wp : 0
+                },
+                // P3 accuracy: page-break
+                "page-break-before" when val == "always" => style with { PageBreakBefore = true },
                 _ => style
             };
         }
@@ -966,98 +996,19 @@ public class LayoutEngine
             : style with { TextColor = parsed.Value };
     }
 
-    private static InheritedStyle ApplyComputedStyle(InheritedStyle style, ICssStyleDeclaration computed)
-    {
-        var display = computed.GetPropertyValue("display");
-        if (display == "none")
-            return style with { IsHidden = true };
-
-        var fontSize = computed.GetPropertyValue("font-size");
-        if (!string.IsNullOrEmpty(fontSize))
-            style = style with { FontSize = ParsePxValue(fontSize, style.FontSize) };
-
-        var fontWeight = computed.GetPropertyValue("font-weight");
-        if (!string.IsNullOrEmpty(fontWeight))
-            style = style with { Bold = fontWeight is "bold" or "700" or "800" or "900" };
-
-        var fontStyle = computed.GetPropertyValue("font-style");
-        if (fontStyle == "italic" || fontStyle == "oblique")
-            style = style with { Italic = true };
-
-        var color = computed.GetPropertyValue("color");
-        if (!string.IsNullOrEmpty(color))
-        {
-            var parsed = ParseCssColor(color);
-            if (parsed.HasValue) style = style with { TextColor = parsed.Value };
-        }
-
-        var bgColor = computed.GetPropertyValue("background-color");
-        if (!string.IsNullOrEmpty(bgColor))
-        {
-            var parsed = ParseCssColor(bgColor);
-            if (parsed.HasValue) style = style with { BackgroundColor = parsed.Value };
-        }
-
-        var fontFamily = computed.GetPropertyValue("font-family");
-        if (!string.IsNullOrEmpty(fontFamily))
-        {
-            var family = fontFamily.Split(',')[0].Trim().Trim('\'', '"');
-            style = style with { FontFamily = family };
-        }
-
-        var textAlign = computed.GetPropertyValue("text-align");
-        style = textAlign switch
-        {
-            "center" => style with { TextAlign = TextAlign.Center },
-            "right" => style with { TextAlign = TextAlign.Right },
-            _ => style
-        };
-
-        var marginTop = computed.GetPropertyValue("margin-top");
-        if (!string.IsNullOrEmpty(marginTop))
-            style = style with { MarginTop = ParsePxValue(marginTop, style.MarginTop) };
-
-        var marginBottom = computed.GetPropertyValue("margin-bottom");
-        if (!string.IsNullOrEmpty(marginBottom))
-            style = style with { MarginBottom = ParsePxValue(marginBottom, style.MarginBottom) };
-
-        var paddingTop = computed.GetPropertyValue("padding-top");
-        if (!string.IsNullOrEmpty(paddingTop))
-            style = style with { PaddingTop = ParsePxValue(paddingTop, style.PaddingTop) };
-
-        var paddingBottom = computed.GetPropertyValue("padding-bottom");
-        if (!string.IsNullOrEmpty(paddingBottom))
-            style = style with { PaddingBottom = ParsePxValue(paddingBottom, style.PaddingBottom) };
-
-        var paddingLeft = computed.GetPropertyValue("padding-left");
-        if (!string.IsNullOrEmpty(paddingLeft))
-            style = style with { PaddingLeft = ParsePxValue(paddingLeft, style.PaddingLeft) };
-
-        var borderWidth = computed.GetPropertyValue("border-width");
-        if (!string.IsNullOrEmpty(borderWidth) && borderWidth != "0px")
-            style = style with { BorderWidth = ParsePxValue(borderWidth, 0) };
-
-        var borderColor = computed.GetPropertyValue("border-color");
-        if (!string.IsNullOrEmpty(borderColor))
-        {
-            var parsed = ParseCssColor(borderColor);
-            if (parsed.HasValue) style = style with { BorderColor = parsed.Value };
-        }
-
-        return style;
-    }
-
+    // P4 accuracy: margin collapsing
     private void ApplyMarginTop(InheritedStyle style)
     {
-        _cursorY += style.MarginTop;
+        var effectiveMargin = Math.Max(style.MarginTop, _lastMarginBottom) - _lastMarginBottom;
+        _cursorY += Math.Max(0, effectiveMargin);
+        _lastMarginBottom = 0;
+
         if (style.BackgroundColor != SKColors.Transparent && style.PaddingTop > 0)
         {
             Boxes.Add(new LayoutBox
             {
-                X = _marginLeft,
-                Y = _cursorY,
-                Width = _contentWidth,
-                Height = style.PaddingTop,
+                X = _marginLeft, Y = _cursorY,
+                Width = _contentWidth, Height = style.PaddingTop,
                 BackgroundColor = style.BackgroundColor
             });
         }
@@ -1066,7 +1017,9 @@ public class LayoutEngine
 
     private void ApplyMarginBottom(InheritedStyle style)
     {
-        _cursorY += style.PaddingBottom + style.MarginBottom;
+        _cursorY += style.PaddingBottom;
+        _lastMarginBottom = style.MarginBottom;
+        _cursorY += style.MarginBottom;
     }
 
     // --- Helpers ---
@@ -1078,7 +1031,7 @@ public class LayoutEngine
         "ADDRESS" or "DETAILS" or "SUMMARY" or "FORM" or "FIELDSET" or
         "DL" or "DD" or "DT" or "LI";
 
-    private static float ParsePxValue(string value, float fallback)
+    internal static float ParsePxValue(string value, float fallback)
     {
         value = value.Trim();
         if (value.EndsWith("px"))
@@ -1149,7 +1102,7 @@ public class LayoutEngine
     private static string NormalizeWhitespace(string text)
     {
         if (string.IsNullOrEmpty(text)) return text;
-        return Regex.Replace(text, @"\s+", " ");
+        return WhitespaceRegex.Replace(text, " ");
     }
 }
 
@@ -1162,14 +1115,7 @@ public class PdfPageSettings
     public int MarginMm { get; set; } = 10;
 }
 
-public enum PageSize
-{
-    A3,
-    A4,
-    A5,
-    Letter,
-    Legal
-}
+public enum PageSize { A3, A4, A5, Letter, Legal }
 
 // --- Inherited Style ---
 
@@ -1191,4 +1137,10 @@ public record InheritedStyle
     public float PaddingBottom { get; init; }
     public float PaddingLeft { get; init; }
     public bool IsHidden { get; init; }
+    // Layout properties
+    public bool FloatLeft { get; init; }
+    public bool ClearBoth { get; init; }
+    public bool DisplayInlineBlock { get; init; }
+    public float WidthPercent { get; init; }
+    public bool PageBreakBefore { get; init; }
 }
