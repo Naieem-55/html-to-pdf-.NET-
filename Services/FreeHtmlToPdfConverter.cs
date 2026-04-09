@@ -6,6 +6,7 @@ using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
 using CSharpMath.SkiaSharp;
 using SkiaSharp;
+using SkiaSharp.HarfBuzz;
 
 namespace html_to_pdf_aspose.Services;
 
@@ -25,12 +26,13 @@ public class FreeHtmlToPdfConverter
         var document = ParseHtml(htmlContent).GetAwaiter().GetResult();
         var parseTime = sw.ElapsedMilliseconds;
 
+        var stylesheet = StyleSheetParser.Parse(document);
         var mathCache = new MathCache();
-        var defaultFontSize = ParseBodyFontSize(document);
+        var defaultFontSize = ParseBodyFontSize(document, stylesheet);
         mathCache.PreMeasure(document, defaultFontSize);
         var mathPreMeasureTime = sw.ElapsedMilliseconds - parseTime;
 
-        var layoutBoxes = LayoutDocument(document, pageSize, margin, mathCache);
+        var layoutBoxes = LayoutDocument(document, pageSize, margin, mathCache, stylesheet);
         var layoutTime = sw.ElapsedMilliseconds - parseTime - mathPreMeasureTime;
 
         var pdf = RenderToPdf(layoutBoxes, pageSize, margin, mathCache);
@@ -43,19 +45,32 @@ public class FreeHtmlToPdfConverter
         return pdf;
     }
 
-    private static float ParseBodyFontSize(IDocument document)
+    private static float ParseBodyFontSize(IDocument document, StyleSheetParser stylesheet)
     {
+        // Check stylesheet body rule first
+        var bodyRule = stylesheet.GetTagRules("body");
+        float fontSize = 12f;
+        if (bodyRule != null)
+        {
+            foreach (var decl in bodyRule.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = decl.Split(':', 2, StringSplitOptions.TrimEntries);
+                if (parts.Length == 2 && parts[0].Equals("font-size", StringComparison.OrdinalIgnoreCase))
+                    fontSize = LayoutEngine.ParsePxValue(parts[1], 12f);
+            }
+        }
+        // Inline style overrides
         var body = document.Body;
-        if (body == null) return 12f;
+        if (body == null) return fontSize;
         var style = body.GetAttribute("style");
-        if (style == null) return 12f;
+        if (style == null) return fontSize;
         foreach (var decl in style.Split(';'))
         {
             var parts = decl.Split(':', 2, StringSplitOptions.TrimEntries);
             if (parts.Length == 2 && parts[0].Equals("font-size", StringComparison.OrdinalIgnoreCase))
-                return LayoutEngine.ParsePxValue(parts[1], 12f);
+                fontSize = LayoutEngine.ParsePxValue(parts[1], fontSize);
         }
-        return 12f;
+        return fontSize;
     }
 
     public byte[] ConvertFromFile(string filePath, PdfPageSettings? settings = null)
@@ -71,9 +86,10 @@ public class FreeHtmlToPdfConverter
         var margin = settings.MarginMm * 2.83465f;
 
         var document = ParseUrl(url).GetAwaiter().GetResult();
+        var stylesheet = StyleSheetParser.Parse(document);
         var mathCache = new MathCache();
-        mathCache.PreMeasure(document, ParseBodyFontSize(document));
-        var layoutBoxes = LayoutDocument(document, pageSize, margin, mathCache);
+        mathCache.PreMeasure(document, ParseBodyFontSize(document, stylesheet));
+        var layoutBoxes = LayoutDocument(document, pageSize, margin, mathCache, stylesheet);
 
         return RenderToPdf(layoutBoxes, pageSize, margin, mathCache);
     }
@@ -105,10 +121,10 @@ public class FreeHtmlToPdfConverter
         return settings.Landscape ? new SKSize(h, w) : new SKSize(w, h);
     }
 
-    private List<LayoutBox> LayoutDocument(IDocument document, SKSize pageSize, float margin, MathCache mathCache)
+    private List<LayoutBox> LayoutDocument(IDocument document, SKSize pageSize, float margin, MathCache mathCache, StyleSheetParser stylesheet)
     {
         var contentWidth = pageSize.Width - margin * 2;
-        var engine = new LayoutEngine(contentWidth, margin, mathCache, pageSize.Height);
+        var engine = new LayoutEngine(contentWidth, margin, mathCache, pageSize.Height, stylesheet);
 
         var body = document.Body;
         if (body == null) return engine.Boxes;
@@ -224,11 +240,13 @@ public class FreeHtmlToPdfConverter
             canvas.DrawRect(box.X, box.Y, box.Width, box.Height, borderPaint);
         }
 
-        // Text — use pooled font
+        // Text — use HarfBuzz shaping for correct Bengali/Indic rendering
         if (!string.IsNullOrEmpty(box.Text))
         {
-            var font = FontCache.Instance.GetFontForText(box.Text, box.FontFamily ?? "Arial", box.FontSize, box.Bold, box.Italic);
+            var typeface = FontCache.Instance.ResolveForText(box.Text, box.FontFamily ?? "Arial", box.Bold, box.Italic);
             textPaint.Color = box.TextColor;
+
+            using var font = new SKFont(typeface, box.FontSize);
 
             var textX = box.X;
             if (box.TextAlign == TextAlign.Center)
@@ -242,7 +260,8 @@ public class FreeHtmlToPdfConverter
                 textX = box.X + box.Width - textWidth;
             }
 
-            canvas.DrawText(box.Text, textX, box.Y + box.FontSize, font, textPaint);
+            var shaper = FontCache.Instance.GetShaper(typeface);
+            canvas.DrawShapedText(shaper, box.Text, textX, box.Y + box.FontSize, SKTextAlign.Left, font, textPaint);
         }
 
         // LaTeX math — cached bounds, MathPainter only for draw
@@ -334,11 +353,11 @@ public class LayoutEngine
 
     private readonly Stack<InheritedStyle> _styleStack = new();
     private readonly MathCache _mathCache;
+    private readonly StyleSheetParser _stylesheet;
 
-    // Compiled regex
     private static readonly Regex WhitespaceRegex = new(@"\s+", RegexOptions.Compiled);
 
-    public LayoutEngine(float contentWidth, float marginLeft, MathCache mathCache, float pageHeight)
+    public LayoutEngine(float contentWidth, float marginLeft, MathCache mathCache, float pageHeight, StyleSheetParser stylesheet)
     {
         _contentWidth = contentWidth;
         _marginLeft = marginLeft;
@@ -347,6 +366,7 @@ public class LayoutEngine
         _floatX = marginLeft;
         _pageHeight = pageHeight;
         _mathCache = mathCache;
+        _stylesheet = stylesheet;
         _styleStack.Push(new InheritedStyle());
     }
 
@@ -419,6 +439,9 @@ public class LayoutEngine
         switch (tagName)
         {
             case "BR":
+                // Skip BR between inline-block siblings (e.g., <br/> between <li> items)
+                if (_inlineBlockX > _marginLeft)
+                    break;
                 FlushInline();
                 break;
 
@@ -449,7 +472,22 @@ public class LayoutEngine
             case "UL":
             case "OL":
                 FlushInline();
-                LayoutList(element, style, tagName == "OL");
+                // Check if list items use inline-block layout (e.g., .list-group-item)
+                // If so, skip bullet generation and let normal layout handle them
+                if (HasInlineBlockChildren(element))
+                {
+                    _inlineBlockX = _marginLeft;
+                    _inlineBlockRowMaxHeight = 0;
+                    ProcessChildNodes(element, style);
+                    // Flush final inline-block row
+                    if (_inlineBlockX > _marginLeft)
+                    {
+                        _cursorY = _inlineBlockRowY + _inlineBlockRowMaxHeight;
+                        _inlineBlockX = _marginLeft;
+                    }
+                }
+                else
+                    LayoutList(element, style, tagName == "OL");
                 break;
 
             default:
@@ -479,16 +517,19 @@ public class LayoutEngine
             _inFloatRow = true;
         }
 
-        // Save state, layout children within the float column
+        // Save ALL state — float state must be isolated per nesting level
         var savedX = _inlineX;
         var savedCursorY = _cursorY;
         var savedContentWidth = _contentWidth;
+        var savedMarginLeft = _marginLeft;
+        var savedFloatX = _floatX;
+        var savedFloatRowY = _floatRowY;
+        var savedInFloatRow = _inFloatRow;
 
         _cursorY = _floatRowY;
         _inlineX = _floatX;
+        _inFloatRow = false; // Reset for children — they start fresh
 
-        // Temporarily narrow content width for child layout
-        var savedMarginLeft = _marginLeft;
         SetContentContext(_floatX, floatWidth);
 
         _styleStack.Push(style);
@@ -498,9 +539,11 @@ public class LayoutEngine
 
         var floatBottom = _cursorY;
 
-        // Restore and advance float X
+        // Restore parent float state and advance
         SetContentContext(savedMarginLeft, savedContentWidth);
-        _floatX += floatWidth;
+        _floatX = savedFloatX + floatWidth;
+        _floatRowY = savedFloatRowY;
+        _inFloatRow = savedInFloatRow;
         _cursorY = Math.Max(savedCursorY, floatBottom);
     }
 
@@ -545,24 +588,34 @@ public class LayoutEngine
             _inlineBlockRowMaxHeight = 0;
         }
 
-        // Layout children within the inline-block
+        // Save ALL state — isolate children's float/inline from parent
         var savedCursorY = _cursorY;
-        _cursorY = _inlineBlockRowY;
-        _inlineX = _inlineBlockX;
-
         var savedMarginLeft = _marginLeft;
         var savedContentWidth = _contentWidth;
+        var savedFloatX = _floatX;
+        var savedFloatRowY = _floatRowY;
+        var savedInFloatRow = _inFloatRow;
+
+        _cursorY = _inlineBlockRowY;
+        _inlineX = _inlineBlockX;
+        _inFloatRow = false; // Children start with fresh float state
+
         SetContentContext(_inlineBlockX, blockWidth);
 
         _styleStack.Push(style);
         ProcessChildNodes(element, style);
         FlushInline();
+        FlushFloatRow();
         _styleStack.Pop();
 
         var blockHeight = _cursorY - _inlineBlockRowY;
         _inlineBlockRowMaxHeight = Math.Max(_inlineBlockRowMaxHeight, blockHeight);
 
+        // Restore parent state
         SetContentContext(savedMarginLeft, savedContentWidth);
+        _floatX = savedFloatX;
+        _floatRowY = savedFloatRowY;
+        _inFloatRow = savedInFloatRow;
         _inlineBlockX += blockWidth;
         _cursorY = Math.Max(savedCursorY, _inlineBlockRowY + _inlineBlockRowMaxHeight);
     }
@@ -668,13 +721,19 @@ public class LayoutEngine
             _inlineMaxHeight = 0;
         }
 
-        var font = FontCache.Instance.GetFontForText(text, style.FontFamily, style.FontSize, style.Bold, style.Italic);
-        var resolvedFamily = font.Typeface.FamilyName;
-        var spaceWidth = font.MeasureText(" ");
+        // Use HarfBuzz for measurement — matches shaped render widths exactly
+        var typeface = FontCache.Instance.ResolveForText(text, style.FontFamily, style.Bold, style.Italic);
+        var resolvedFamily = typeface.FamilyName;
+        using var font = new SKFont(typeface, style.FontSize);
+        var shaper = FontCache.Instance.GetShaper(typeface);
+
+        var spaceResult = shaper.Shape(" ", font);
+        var spaceWidth = spaceResult.Width > 0 ? spaceResult.Width : font.MeasureText(" ");
 
         foreach (var word in words)
         {
-            var wordWidth = font.MeasureText(word);
+            var shapedResult = shaper.Shape(word, font);
+            var wordWidth = shapedResult.Width > 0 ? shapedResult.Width : font.MeasureText(word);
 
             if (_inlineX + wordWidth > rightEdge && _inlineX > _marginLeft + style.PaddingLeft)
             {
@@ -864,6 +923,14 @@ public class LayoutEngine
         _cursorY += 4;
     }
 
+    private bool HasInlineBlockChildren(IElement element)
+    {
+        var firstLi = element.QuerySelector(":scope > li");
+        if (firstLi == null) return false;
+        var liStyle = ResolveStyle(firstLi);
+        return liStyle.DisplayInlineBlock && liStyle.WidthPercent > 0;
+    }
+
     // --- List ---
 
     private void LayoutList(IElement list, InheritedStyle parentStyle, bool ordered)
@@ -926,12 +993,20 @@ public class LayoutEngine
             _ => style
         };
 
+        // Apply stylesheet tag rules (e.g., p { margin:0 }, body { font-size:5mm })
+        var tagRules = _stylesheet.GetTagRules(tagName);
+        if (tagRules != null)
+            style = ApplyInlineStyle(style, tagRules);
+
+        // Apply stylesheet class rules (e.g., .optionNumbering { float:left; width:24% })
+        var classRules = _stylesheet.GetClassRules(element);
+        if (classRules != null)
+            style = ApplyInlineStyle(style, classRules);
+
+        // Inline style overrides everything (highest specificity)
         var inlineStyle = element.GetAttribute("style");
         if (!string.IsNullOrEmpty(inlineStyle))
             style = ApplyInlineStyle(style, inlineStyle);
-
-        // Body font-size handled by ParseBodyFontSize + inline style parser.
-        // No GetComputedStyle needed — allows dropping AngleSharp.Css dependency.
 
         return style;
     }

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using SkiaSharp;
+using SkiaSharp.HarfBuzz;
 
 namespace html_to_pdf_aspose.Services;
 
@@ -10,6 +11,7 @@ public sealed class FontCache
     private readonly ConcurrentDictionary<(string family, int weight, int slant), SKTypeface> _typefaceCache = new();
     private readonly ConcurrentDictionary<(char ch, int weight, int slant), SKTypeface> _charFallbackCache = new();
     private readonly ConcurrentDictionary<(string family, float size, int weight, int slant), SKFont> _fontCache = new();
+    private readonly ConcurrentDictionary<string, SKShaper> _shaperCache = new();
 
     public SKTypeface GetTypeface(string family, bool bold, bool italic)
     {
@@ -62,6 +64,14 @@ public sealed class FontCache
         var key = (typeface.FamilyName, size, weight, slant);
 
         return _fontCache.GetOrAdd(key, _ => new SKFont(typeface, size));
+    }
+
+    /// <summary>
+    /// Get a cached SKShaper for HarfBuzz text shaping. DO NOT dispose — owned by the cache.
+    /// </summary>
+    public SKShaper GetShaper(SKTypeface typeface)
+    {
+        return _shaperCache.GetOrAdd(typeface.FamilyName, _ => new SKShaper(typeface));
     }
 
     private SKTypeface ResolveForChar(char ch, bool bold, bool italic)
