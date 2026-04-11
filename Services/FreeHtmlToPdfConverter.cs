@@ -375,6 +375,17 @@ public class FreeHtmlToPdfConverter
             canvas.DrawLine(box.X, hrY, box.X + box.Width, hrY, hrPaint);
         }
 
+        // Inline image (data:image/png;base64)
+        if (box.ImageData != null)
+        {
+            using var bitmap = SKBitmap.Decode(box.ImageData);
+            if (bitmap != null)
+            {
+                var dest = new SKRect(box.X, box.Y, box.X + box.Width, box.Y + box.Height);
+                canvas.DrawBitmap(bitmap, dest);
+            }
+        }
+
         // Border-left line (column divider)
         if (box.BorderLeftLine)
         {
@@ -407,6 +418,7 @@ public record LayoutBox
     public string? LaTeX { get; init; }
     public bool IsDisplayMath { get; init; }
     public bool BorderLeftLine { get; init; }
+    public byte[]? ImageData { get; init; }
 }
 
 public enum TextAlign { Left, Center, Right }
@@ -566,7 +578,7 @@ public class LayoutEngine
                 break;
 
             case "IMG":
-                EmitPlainText($"[{element.GetAttribute("alt") ?? "image"}]", style);
+                EmitImage(element, style);
                 break;
 
             case "TABLE":
@@ -946,6 +958,78 @@ public class LayoutEngine
     }
 
     // --- Text ---
+
+    // --- Image Emission ---
+
+    private void EmitImage(IElement element, InheritedStyle style)
+    {
+        var src = element.GetAttribute("src");
+        if (string.IsNullOrEmpty(src))
+        {
+            var alt = element.GetAttribute("alt");
+            if (!string.IsNullOrEmpty(alt)) EmitPlainText($"[{alt}]", style);
+            return;
+        }
+
+        // Handle data:image/png;base64,... URLs
+        if (src.StartsWith("data:image/"))
+        {
+            var commaIdx = src.IndexOf(',');
+            if (commaIdx < 0) return;
+
+            try
+            {
+                var base64 = src[(commaIdx + 1)..];
+                var bytes = Convert.FromBase64String(base64);
+                using var bitmap = SKBitmap.Decode(bytes);
+                if (bitmap == null) return;
+
+                // Scale image to fit inline, matching font height
+                var maxHeight = style.FontSize * style.LineHeight * 1.5f;
+                var scale = maxHeight / bitmap.Height;
+                var imgWidth = bitmap.Width * scale;
+                var imgHeight = bitmap.Height * scale;
+
+                if (!_inInline)
+                {
+                    _inlineX = _marginLeft + style.PaddingLeft;
+                    _inInline = true;
+                    _inlineMaxHeight = 0;
+                }
+
+                var rightEdge = _marginLeft + _contentWidth;
+                if (_inlineX + imgWidth > rightEdge && _inlineX > _marginLeft + style.PaddingLeft)
+                {
+                    _cursorY += Math.Max(style.FontSize * style.LineHeight, _inlineMaxHeight);
+                    _inlineX = _marginLeft + style.PaddingLeft;
+                    _inlineMaxHeight = 0;
+                }
+
+                _inlineMaxHeight = Math.Max(_inlineMaxHeight, imgHeight);
+
+                Boxes.Add(new LayoutBox
+                {
+                    X = _inlineX,
+                    Y = _cursorY,
+                    Width = imgWidth,
+                    Height = imgHeight,
+                    ImageData = bytes
+                });
+
+                _inlineX += imgWidth + 2;
+            }
+            catch
+            {
+                var alt = element.GetAttribute("alt");
+                if (!string.IsNullOrEmpty(alt)) EmitPlainText($"[{alt}]", style);
+            }
+        }
+        else
+        {
+            var alt = element.GetAttribute("alt") ?? "image";
+            if (!string.IsNullOrEmpty(alt)) EmitPlainText($"[{alt}]", style);
+        }
+    }
 
     private void EmitPlainText(string text, InheritedStyle style)
     {
@@ -1460,7 +1544,16 @@ public class LayoutEngine
     private static string NormalizeWhitespace(string text)
     {
         if (string.IsNullOrEmpty(text)) return text;
-        return WhitespaceRegex.Replace(text, " ");
+        text = WhitespaceRegex.Replace(text, " ");
+        // Normalize typographic quotes and special punctuation to ASCII
+        text = text.Replace('\u2018', '\'')  // left single quote → '
+                   .Replace('\u2019', '\'')  // right single quote → '
+                   .Replace('\u201C', '"')   // left double quote → "
+                   .Replace('\u201D', '"')   // right double quote → "
+                   .Replace('\u2013', '-')   // en dash → -
+                   .Replace('\u2014', '-')   // em dash → -
+                   .Replace('\u00A0', ' ');  // non-breaking space → space
+        return text;
     }
 }
 
