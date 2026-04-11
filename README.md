@@ -1,15 +1,16 @@
 # HTML to PDF Converter (.NET)
 
-A high-performance HTML to PDF converter built with .NET 8 — no browser engine, no WebKit, no Chromium. Converts HTML with CSS styling, LaTeX math formulas, and Bengali/Indic text to vector PDF.
+A high-performance HTML to PDF converter built with .NET 8 — no browser engine, no WebKit, no Chromium. Converts HTML with CSS styling, LaTeX math formulas, and Bengali/Indic text to vector PDF with automatic two-column exam paper layout.
 
 ## Architecture
 
 ```
 HTML string
   -> AngleSharp              (parse HTML into DOM tree)
-  -> StyleSheetParser        (extract <style> class rules — lightweight, no CSS engine)
+  -> OverrideBodyFontSize    (apply data-textfontsize/data-eqfontsize scaling)
+  -> StyleSheetParser        (extract <style> class rules + descendant selectors)
   -> MathCache               (pre-measure all LaTeX formulas)
-  -> LayoutEngine            (block/inline/float/inline-block flow, word wrap)
+  -> LayoutEngine            (block/inline/float/inline-block/two-column flow)
   -> SkiaSharp + HarfBuzz    (render text with complex script shaping)
   -> CSharpMath              (render LaTeX math formulas)
   -> SKDocument              (vector PDF output)
@@ -29,11 +30,13 @@ All dependencies are MIT-licensed. No commercial licenses required.
 ## Features
 
 - **No browser engine** — fully native .NET pipeline, no Chromium/WebKit/Puppeteer
+- **Two-column exam paper layout** — auto-detects `.questionPages` container and arranges questions in two columns with divider line
 - **LaTeX math rendering** — `<span class="math-tex">\(...\)</span>`, `$...$`, `$$...$$` with fractions, matrices, integrals, Greek letters
 - **Bengali/Indic text shaping** — HarfBuzz OpenType GSUB/GPOS for correct conjuncts, vowel signs, and ligatures
-- **CSS layout support** — `float:left`, `display:inline-block`, `width:%`, `page-break-before:always`, margin collapsing
-- **Stylesheet parsing** — extracts class rules from `<style>` blocks without a CSS engine
-- **Font fallback** — automatic Arial -> Nirmala UI for non-Latin scripts
+- **CSS layout support** — `float:left`, `display:inline-block`, `width:%`, `page-break-before:always`, margin collapsing, shorthand `margin`/`padding`
+- **Stylesheet parsing** — extracts class rules AND descendant selectors (`.parent .child`) from `<style>` blocks
+- **Font scaling** — reads `data-textfontsize` and `data-eqfontsize` body attributes for compact exam paper density
+- **Font fallback** — automatic Arial -> Nirmala UI for Bengali/Indic scripts
 - **Batch conversion** — convert multiple HTML files in parallel using all CPU cores, output as ZIP
 - **Four input modes** — HTML editor, single file upload, URL, or batch file upload
 - **Configurable output** — page size (A4/A3/A5/Letter/Legal), margins, landscape orientation
@@ -41,16 +44,16 @@ All dependencies are MIT-licensed. No commercial licenses required.
 
 ## Performance
 
-Benchmarked with a 426-formula engineering exam paper (Bengali + English + LaTeX):
+Benchmarked with a 100-question engineering exam paper (Bengali + English + LaTeX):
 
 | Metric | Value |
 |--------|-------|
-| Total conversion time | **~528ms** |
-| Parse (AngleSharp) | 58ms |
-| Math pre-measure (261 unique formulas) | 174ms |
-| Layout (2592 boxes) | 43ms |
-| PDF render (11 pages) | 253ms |
-| Output PDF size | 3.5 MB |
+| Total conversion time | **~775ms** |
+| Parse (AngleSharp) | 60ms |
+| Math pre-measure (532 formulas) | 178ms |
+| Layout (2594 boxes) | 82ms |
+| PDF render (3 pages) | 455ms |
+| Output | 3 pages, two-column layout |
 
 ### Optimization journey
 
@@ -62,7 +65,8 @@ Benchmarked with a 426-formula engineering exam paper (Bengali + English + LaTeX
 | + Inline style parser | 1,002ms | 12.9x | Replace CSS engine with string split |
 | + Math cache | 972ms | 13.3x | Pre-measure formulas, no duplicate work |
 | + Drop AngleSharp.Css | 967ms | 13.4x | Remove CSS engine initialization |
-| + StyleSheet parser + HarfBuzz | **528ms** | **24.5x** | Class rules + shaped text measurement |
+| + StyleSheet + HarfBuzz | 528ms | 24.5x | Class rules + shaped text measurement |
+| + Two-column layout | **775ms** | **16.7x** | Exam paper format, font scaling |
 
 ## Getting Started
 
@@ -83,7 +87,7 @@ Navigate to `http://localhost:5204/Pdf` in your browser.
 
 ### Usage
 
-**Web UI**: Two tabs:
+**Web UI** — three modes:
 - **Single File** — paste HTML, upload a file, or enter a URL
 - **Batch Convert** — upload multiple HTML files, converts in parallel, downloads ZIP
 
@@ -103,18 +107,30 @@ byte[] pdf = converter.ConvertFromHtmlString(html, new PdfPageSettings
 {
     PageSize = PageSize.A4,
     Landscape = false,
-    MarginMm = 10
+    MarginMm = 6
 });
 
 // Batch conversion (parallel, uses all CPU cores)
-var htmlFiles = Directory.GetFiles("input/", "*.html");
-Parallel.ForEach(htmlFiles, file =>
+Parallel.ForEach(Directory.GetFiles("input/", "*.html"), file =>
 {
     var conv = new FreeHtmlToPdfConverter();
-    var pdf = conv.ConvertFromFile(file);
-    File.WriteAllBytes(Path.ChangeExtension(file, ".pdf"), pdf);
+    File.WriteAllBytes(
+        Path.ChangeExtension(file, ".pdf"),
+        conv.ConvertFromFile(file));
 });
 ```
+
+## Exam Paper Format
+
+When the HTML contains a `div.questionPages` container, the converter automatically:
+
+1. Lays out all `.question` elements in **two columns** with a vertical divider
+2. Reads `data-textfontsize` and `data-eqfontsize` from `<body>` for compact font sizing
+3. Scales all inline `font-size` values proportionally
+4. Fills left column first, then right column, then next page
+5. Accounts for banner height on the first page
+
+Target: ~50 questions per page for a typical MCQ exam paper.
 
 ## LaTeX Support
 
@@ -136,45 +152,47 @@ Unsupported commands (`\underset`, `\overset`, `\operatorname`) are automaticall
 
 ## CSS Layout Support
 
-| Feature | Status | Implementation |
-|---------|--------|---------------|
-| `float: left` + `width: %` | Supported | Side-by-side columns (question numbers, option labels) |
-| `display: inline-block` + `width: %` | Supported | Grid layout (4 MCQ options per row) |
-| `page-break-before: always` | Supported | Force new page |
-| `clear: both` | Supported | Reset float context |
-| Margin collapsing | Supported | `max(prevBottom, currTop)` |
-| Inline styles | Supported | Fast string-split parser |
-| `<style>` class rules | Supported | StyleSheetParser (regex-based) |
-| Nested floats | Supported | Isolated float state per nesting level |
+| Feature | Status |
+|---------|--------|
+| `float: left` + `width: %` | Supported (side-by-side columns) |
+| `display: inline-block` + `width: %` | Supported (MCQ option grid) |
+| `page-break-before: always` | Supported |
+| `clear: both` | Supported |
+| Margin collapsing | Supported |
+| Shorthand `margin` / `padding` | Supported |
+| Inline styles | Supported (fast string-split parser) |
+| `<style>` class rules | Supported (simple + descendant selectors) |
+| Nested float isolation | Supported |
+| `height`, `border-left` | Supported |
+| `data-textfontsize` / `data-eqfontsize` | Supported (body attributes) |
 
 ## Project Structure
 
 ```
 html-to-pdf-.NET-/
   Controllers/
-    PdfController.cs            # Single + batch convert endpoints, timing logs
+    PdfController.cs            # Single + batch endpoints, timing logs
   Models/
-    ConvertViewModel.cs         # Form model, batch result item
+    ConvertViewModel.cs         # Form model, batch result
   Services/
     FreeHtmlToPdfConverter.cs   # Core pipeline: parse -> layout -> render
-    FontCache.cs                # Typeface/font/shaper caching + fallback
+    FontCache.cs                # Typeface/font caching + Bengali fallback
     MathCache.cs                # LaTeX pre-measurement cache
-    StyleSheetParser.cs         # Lightweight <style> block parser
+    StyleSheetParser.cs         # Lightweight <style> parser (class + descendant)
   Views/
     Pdf/Index.cshtml            # Web UI: single + batch tabs
     Pdf/_PdfSettings.cshtml     # Shared page settings partial
   plan.md                       # Optimization roadmap
   full_cpu_usage.md             # CPU parallelization analysis
+  question_format.md            # Exam paper layout plan
 ```
 
 ## Known Limitations
 
-- Bengali line-breaking uses space-only splitting (UAX #14 not implemented)
-- No CSS `flexbox` or `grid` layout
-- No JavaScript execution
 - No image embedding (shows `[alt text]` placeholder)
 - CSharpMath doesn't support `\newcommand`, `\def`, or `\text{...$...$}`
+- Two-column layout only triggers for `.questionPages` container
 
 ## License
 
-MIT
+    MIT
