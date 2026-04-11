@@ -171,7 +171,7 @@ Unsupported commands (`\underset`, `\overset`, `\operatorname`) are automaticall
 ## Project Structure
 
 ```
-html-to-pdf-.NET-/
+html-to-pdf-.NET/
   Controllers/
     PdfController.cs            # Single + batch endpoints, timing logs
   Models/
