@@ -1,17 +1,18 @@
 # HTML to PDF Converter (.NET)
 
-A high-performance HTML to PDF converter built with .NET 8 — no browser engine, no WebKit, no Chromium. Converts HTML with CSS styling and LaTeX math formulas to vector PDF using a fully managed pipeline.
+A high-performance HTML to PDF converter built with .NET 8 — no browser engine, no WebKit, no Chromium. Converts HTML with CSS styling, LaTeX math formulas, and Bengali/Indic text to vector PDF.
 
 ## Architecture
 
 ```
-HTML input
-  -> AngleSharp         (parse HTML into DOM tree)
-  -> Inline Style Parser (extract CSS properties — no slow GetComputedStyle)
-  -> Layout Engine       (block/inline flow, word wrap, font fallback)
-  -> CSharpMath          (measure & render LaTeX from <span class="math-tex">)
-  -> SkiaSharp           (SKDocument -> vector PDF with selectable text)
-  -> PDF output
+HTML string
+  -> AngleSharp              (parse HTML into DOM tree)
+  -> StyleSheetParser        (extract <style> class rules — lightweight, no CSS engine)
+  -> MathCache               (pre-measure all LaTeX formulas)
+  -> LayoutEngine            (block/inline/float/inline-block flow, word wrap)
+  -> SkiaSharp + HarfBuzz    (render text with complex script shaping)
+  -> CSharpMath              (render LaTeX math formulas)
+  -> SKDocument              (vector PDF output)
 ```
 
 ## Tech Stack
@@ -19,21 +20,24 @@ HTML input
 | Package | Version | License | Role |
 |---------|---------|---------|------|
 | [AngleSharp](https://github.com/AngleSharp/AngleSharp) | 0.17.1 | MIT | HTML/DOM parser |
-| [AngleSharp.Css](https://github.com/AgleSharp/AngleSharp.Css) | 0.17.0 | MIT | CSS engine (body-level styles) |
 | [SkiaSharp](https://github.com/mono/SkiaSharp) | 3.119.2 | MIT | PDF rendering via `SKDocument`/`SKCanvas` |
+| [SkiaSharp.HarfBuzz](https://github.com/mono/SkiaSharp) | 3.119.2 | MIT | Complex text shaping (Bengali conjuncts, ligatures) |
 | [CSharpMath.SkiaSharp](https://github.com/verybadcat/CSharpMath) | 1.0.0-pre.1 | MIT | LaTeX math formula rendering |
 
 All dependencies are MIT-licensed. No commercial licenses required.
 
 ## Features
 
-- **No browser engine** — pure C# pipeline, no Chromium/WebKit/Puppeteer dependency
-- **LaTeX math rendering** — supports `<span class="math-tex">\(...\)</span>` notation with fractions, matrices, integrals, Greek letters, and more
-- **Bengali/Indic font fallback** — automatic detection of non-Latin text with fallback to Nirmala UI via `SKFontManager.MatchCharacter()`
-- **Three input modes** — HTML string, file upload, or URL
+- **No browser engine** — fully native .NET pipeline, no Chromium/WebKit/Puppeteer
+- **LaTeX math rendering** — `<span class="math-tex">\(...\)</span>`, `$...$`, `$$...$$` with fractions, matrices, integrals, Greek letters
+- **Bengali/Indic text shaping** — HarfBuzz OpenType GSUB/GPOS for correct conjuncts, vowel signs, and ligatures
+- **CSS layout support** — `float:left`, `display:inline-block`, `width:%`, `page-break-before:always`, margin collapsing
+- **Stylesheet parsing** — extracts class rules from `<style>` blocks without a CSS engine
+- **Font fallback** — automatic Arial -> Nirmala UI for non-Latin scripts
+- **Batch conversion** — convert multiple HTML files in parallel using all CPU cores, output as ZIP
+- **Four input modes** — HTML editor, single file upload, URL, or batch file upload
 - **Configurable output** — page size (A4/A3/A5/Letter/Legal), margins, landscape orientation
 - **Vector PDF** — text remains selectable, math renders as vector graphics
-- **Performance optimized** — font caching, math pre-measurement, inline style parser
 
 ## Performance
 
@@ -41,29 +45,31 @@ Benchmarked with a 426-formula engineering exam paper (Bengali + English + LaTeX
 
 | Metric | Value |
 |--------|-------|
-| Total conversion time | **~970ms** |
-| Parse (AngleSharp) | 249ms |
-| Math pre-measure (532 formulas) | 294ms |
-| Layout (2992 boxes) | 136ms |
-| PDF render | 288ms |
-| Output PDF size | 4.1 MB |
+| Total conversion time | **~528ms** |
+| Parse (AngleSharp) | 58ms |
+| Math pre-measure (261 unique formulas) | 174ms |
+| Layout (2592 boxes) | 43ms |
+| PDF render (11 pages) | 253ms |
+| Output PDF size | 3.5 MB |
 
-### Optimization history
+### Optimization journey
 
-| Version | Time | Change |
-|---------|------|--------|
-| Initial | 12,935ms | Baseline with `GetComputedStyle` per element |
-| + Font caching | 11,929ms | Cache `SKTypeface` instances |
-| + Skip `IsDisplayNone` | 5,940ms | Merge display check into style resolution |
-| + Inline style parser | 1,002ms | Replace `GetComputedStyle` with string split parser |
-| + Math cache | 972ms | Pre-measure formulas, eliminate duplicate work |
+| Version | Time | Speedup | Key change |
+|---------|------|---------|------------|
+| Initial | 12,935ms | 1x | `GetComputedStyle` per element |
+| + Font caching | 11,929ms | 1.1x | Cache `SKTypeface` instances |
+| + Merge IsDisplayNone | 5,940ms | 2.2x | Single `GetComputedStyle` per element |
+| + Inline style parser | 1,002ms | 12.9x | Replace CSS engine with string split |
+| + Math cache | 972ms | 13.3x | Pre-measure formulas, no duplicate work |
+| + Drop AngleSharp.Css | 967ms | 13.4x | Remove CSS engine initialization |
+| + StyleSheet parser + HarfBuzz | **528ms** | **24.5x** | Class rules + shaped text measurement |
 
 ## Getting Started
 
 ### Prerequisites
 
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) or later
-- Windows (for Nirmala UI Bengali font fallback) — Linux/macOS work with different fallback fonts
+- Windows (for Nirmala UI Bengali font) — Linux/macOS work with different fallback fonts
 
 ### Run
 
@@ -73,11 +79,13 @@ cd html-to-pdf-.NET-
 dotnet run
 ```
 
-Navigate to `https://localhost:<port>/Pdf` in your browser.
+Navigate to `http://localhost:5204/Pdf` in your browser.
 
 ### Usage
 
-**Web UI**: Paste HTML, upload a `.html` file, or enter a URL. Configure page size, margins, and orientation. Click "Convert to PDF".
+**Web UI**: Two tabs:
+- **Single File** — paste HTML, upload a file, or enter a URL
+- **Batch Convert** — upload multiple HTML files, converts in parallel, downloads ZIP
 
 **Programmatic**:
 
@@ -97,13 +105,20 @@ byte[] pdf = converter.ConvertFromHtmlString(html, new PdfPageSettings
     Landscape = false,
     MarginMm = 10
 });
+
+// Batch conversion (parallel, uses all CPU cores)
+var htmlFiles = Directory.GetFiles("input/", "*.html");
+Parallel.ForEach(htmlFiles, file =>
+{
+    var conv = new FreeHtmlToPdfConverter();
+    var pdf = conv.ConvertFromFile(file);
+    File.WriteAllBytes(Path.ChangeExtension(file, ".pdf"), pdf);
+});
 ```
 
 ## LaTeX Support
 
-Math formulas are detected from `<span class="math-tex">\(...\)</span>` elements (common in MathJax/KaTeX-based HTML) and from `$...$` / `$$...$$` delimiters in text.
-
-Supported LaTeX:
+Math formulas detected from `<span class="math-tex">\(...\)</span>` (MathJax/KaTeX HTML) and `$...$` / `$$...$$` in text.
 
 | Category | Examples |
 |----------|---------|
@@ -119,37 +134,46 @@ Supported LaTeX:
 
 Unsupported commands (`\underset`, `\overset`, `\operatorname`) are automatically converted to compatible equivalents.
 
+## CSS Layout Support
+
+| Feature | Status | Implementation |
+|---------|--------|---------------|
+| `float: left` + `width: %` | Supported | Side-by-side columns (question numbers, option labels) |
+| `display: inline-block` + `width: %` | Supported | Grid layout (4 MCQ options per row) |
+| `page-break-before: always` | Supported | Force new page |
+| `clear: both` | Supported | Reset float context |
+| Margin collapsing | Supported | `max(prevBottom, currTop)` |
+| Inline styles | Supported | Fast string-split parser |
+| `<style>` class rules | Supported | StyleSheetParser (regex-based) |
+| Nested floats | Supported | Isolated float state per nesting level |
+
 ## Project Structure
 
 ```
 html-to-pdf-.NET-/
   Controllers/
-    PdfController.cs          # Web API: convert endpoint with timing logs
+    PdfController.cs            # Single + batch convert endpoints, timing logs
   Models/
-    ConvertViewModel.cs       # Form model: source, page settings
+    ConvertViewModel.cs         # Form model, batch result item
   Services/
-    FreeHtmlToPdfConverter.cs  # Core: parse -> layout -> render pipeline
-    FontCache.cs              # Typeface caching + Bengali fallback
-    MathCache.cs              # LaTeX pre-measurement cache
+    FreeHtmlToPdfConverter.cs   # Core pipeline: parse -> layout -> render
+    FontCache.cs                # Typeface/font/shaper caching + fallback
+    MathCache.cs                # LaTeX pre-measurement cache
+    StyleSheetParser.cs         # Lightweight <style> block parser
   Views/
-    Pdf/Index.cshtml           # Web UI: HTML editor, file upload, URL input
-  plan.md                      # Future optimization roadmap
+    Pdf/Index.cshtml            # Web UI: single + batch tabs
+    Pdf/_PdfSettings.cshtml     # Shared page settings partial
+  plan.md                       # Optimization roadmap
+  full_cpu_usage.md             # CPU parallelization analysis
 ```
 
-## Roadmap
+## Known Limitations
 
-See [plan.md](plan.md) for the full optimization and accuracy roadmap. Key items:
-
-**Speed** (target: ~400-500ms)
-- Cache `SKPicture` for math render — avoid recreating `MathPainter` during PDF draw
-- Reuse `SKPaint`/`SKFont` across render loop — reduce 20K+ object allocations
-- Drop `AngleSharp.Css` dependency — replace with regex-based `<style>` parser
-
-**Layout accuracy**
-- CSS `float: left` + `width: %` — side-by-side question numbering
-- CSS `display: inline-block` — MCQ options in grid layout
-- `page-break-before: always` — correct multi-page breaks
-- HarfBuzzSharp integration — proper Bengali conjunct rendering
+- Bengali line-breaking uses space-only splitting (UAX #14 not implemented)
+- No CSS `flexbox` or `grid` layout
+- No JavaScript execution
+- No image embedding (shows `[alt text]` placeholder)
+- CSharpMath doesn't support `\newcommand`, `\def`, or `\text{...$...$}`
 
 ## License
 
