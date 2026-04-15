@@ -439,6 +439,12 @@ public class LayoutEngine
     private bool _inInline;
     private float _inlineMaxHeight;
 
+    // Inline-line alignment tracking (for text-align: center / right)
+    private int _inlineLineStartIdx;
+    private float _inlineLineLeftEdge;
+    private float _inlineLineAvailableWidth;
+    private TextAlign _inlineLineAlignment;
+
     // Float state (P0 accuracy: CSS float layout)
     private float _floatX;
     private float _floatRowY;
@@ -1024,14 +1030,17 @@ public class LayoutEngine
                     _inlineX = _marginLeft + style.PaddingLeft;
                     _inInline = true;
                     _inlineMaxHeight = 0;
+                    BeginInlineLine(style);
                 }
 
                 var rightEdge = _marginLeft + _contentWidth;
                 if (_inlineX + imgWidth > rightEdge && _inlineX > _marginLeft + style.PaddingLeft)
                 {
+                    ApplyInlineLineAlignment();
                     _cursorY += Math.Max(style.FontSize * style.LineHeight, _inlineMaxHeight);
                     _inlineX = _marginLeft + style.PaddingLeft;
                     _inlineMaxHeight = 0;
+                    BeginInlineLine(style);
                 }
 
                 _inlineMaxHeight = Math.Max(_inlineMaxHeight, imgHeight);
@@ -1065,14 +1074,16 @@ public class LayoutEngine
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (words.Length == 0) return;
 
+        var leftEdge = _marginLeft + style.PaddingLeft;
         var rightEdge = _marginLeft + _contentWidth;
         var lineHeight = style.FontSize * style.LineHeight;
 
         if (!_inInline)
         {
-            _inlineX = _marginLeft + style.PaddingLeft;
+            _inlineX = leftEdge;
             _inInline = true;
             _inlineMaxHeight = 0;
+            BeginInlineLine(style);
         }
 
         // Use HarfBuzz for measurement — matches shaped render widths exactly
@@ -1089,11 +1100,14 @@ public class LayoutEngine
             var shapedResult = shaper.Shape(word, font);
             var wordWidth = shapedResult.Width > 0 ? shapedResult.Width : font.MeasureText(word);
 
-            if (_inlineX + wordWidth > rightEdge && _inlineX > _marginLeft + style.PaddingLeft)
+            if (_inlineX + wordWidth > rightEdge && _inlineX > leftEdge)
             {
+                // Soft wrap: shift the completed line, then start a new one
+                ApplyInlineLineAlignment();
                 _cursorY += Math.Max(lineHeight, _inlineMaxHeight);
-                _inlineX = _marginLeft + style.PaddingLeft;
+                _inlineX = leftEdge;
                 _inlineMaxHeight = 0;
+                BeginInlineLine(style);
             }
 
             _inlineMaxHeight = Math.Max(_inlineMaxHeight, lineHeight);
@@ -1110,7 +1124,7 @@ public class LayoutEngine
                 Bold = style.Bold,
                 Italic = style.Italic,
                 TextColor = style.TextColor,
-                TextAlign = style.TextAlign
+                TextAlign = TextAlign.Left
             });
 
             _inlineX += wordWidth + spaceWidth;
@@ -1141,14 +1155,17 @@ public class LayoutEngine
             _inlineX = _marginLeft + style.PaddingLeft;
             _inInline = true;
             _inlineMaxHeight = 0;
+            BeginInlineLine(style);
         }
 
         var rightEdge = _marginLeft + _contentWidth;
         if (_inlineX + mathWidth > rightEdge && _inlineX > _marginLeft + style.PaddingLeft)
         {
+            ApplyInlineLineAlignment();
             _cursorY += Math.Max(style.FontSize * style.LineHeight, _inlineMaxHeight);
             _inlineX = _marginLeft + style.PaddingLeft;
             _inlineMaxHeight = 0;
+            BeginInlineLine(style);
         }
 
         // When the math starts a line (fresh line or after wrap) and its ascent is taller than
@@ -1219,12 +1236,55 @@ public class LayoutEngine
     {
         if (_inInline)
         {
+            ApplyInlineLineAlignment();
             var style = _styleStack.Peek();
             var lineHeight = Math.Max(style.FontSize * style.LineHeight, _inlineMaxHeight);
             _cursorY += lineHeight;
             _inlineX = _marginLeft;
             _inInline = false;
             _inlineMaxHeight = 0;
+        }
+    }
+
+    /// <summary>
+    /// Begin tracking a new inline line for text-align purposes. Called when an inline
+    /// emission starts (transition from !_inInline to _inInline) or after a soft line wrap.
+    /// </summary>
+    private void BeginInlineLine(InheritedStyle style)
+    {
+        _inlineLineStartIdx = Boxes.Count;
+        _inlineLineLeftEdge = _marginLeft + style.PaddingLeft;
+        _inlineLineAvailableWidth = _contentWidth - style.PaddingLeft;
+        _inlineLineAlignment = style.TextAlign;
+    }
+
+    /// <summary>
+    /// If the current inline line has center/right alignment, shift all boxes added
+    /// since BeginInlineLine by the appropriate offset. Called from FlushInline and
+    /// from soft-wrap points within inline emitters.
+    /// </summary>
+    private void ApplyInlineLineAlignment()
+    {
+        if (_inlineLineAlignment == TextAlign.Left) return;
+        if (_inlineLineStartIdx >= Boxes.Count) return;
+
+        float maxX = 0;
+        for (int i = _inlineLineStartIdx; i < Boxes.Count; i++)
+        {
+            var b = Boxes[i];
+            if (b.X + b.Width > maxX) maxX = b.X + b.Width;
+        }
+        var lineWidth = maxX - _inlineLineLeftEdge;
+        if (lineWidth <= 0) return;
+
+        float offset = _inlineLineAlignment == TextAlign.Center
+            ? (_inlineLineAvailableWidth - lineWidth) / 2f
+            : _inlineLineAvailableWidth - lineWidth;
+        if (offset <= 0.5f) return;
+
+        for (int i = _inlineLineStartIdx; i < Boxes.Count; i++)
+        {
+            Boxes[i] = Boxes[i] with { X = Boxes[i].X + offset };
         }
     }
 
