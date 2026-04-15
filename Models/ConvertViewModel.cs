@@ -1,6 +1,6 @@
-using html_to_pdf_aspose.Services;
+using HtmlToPdf.Services;
 
-namespace html_to_pdf_aspose.Models;
+namespace HtmlToPdf.Models;
 
 public class ConvertViewModel
 {

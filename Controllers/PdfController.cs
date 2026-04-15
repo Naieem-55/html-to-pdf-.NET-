@@ -1,9 +1,9 @@
 using System.Diagnostics;
-using html_to_pdf_aspose.Models;
-using html_to_pdf_aspose.Services;
+using HtmlToPdf.Models;
+using HtmlToPdf.Services;
 using Microsoft.AspNetCore.Mvc;
 
-namespace html_to_pdf_aspose.Controllers;
+namespace HtmlToPdf.Controllers;
 
 public class PdfController : Controller
 {

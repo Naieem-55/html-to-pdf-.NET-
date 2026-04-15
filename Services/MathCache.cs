@@ -3,7 +3,7 @@ using AngleSharp.Dom;
 using CSharpMath.SkiaSharp;
 using SkiaSharp;
 
-namespace html_to_pdf_aspose.Services;
+namespace HtmlToPdf.Services;
 
 /// <summary>
 /// Pre-measures all LaTeX formulas, caches measurements + SKPicture for render reuse.

@@ -1,8 +1,8 @@
 using System.Diagnostics;
-using html_to_pdf_aspose.Models;
+using HtmlToPdf.Models;
 using Microsoft.AspNetCore.Mvc;
 
-namespace html_to_pdf_aspose.Controllers
+namespace HtmlToPdf.Controllers
 {
     public class HomeController : Controller
     {

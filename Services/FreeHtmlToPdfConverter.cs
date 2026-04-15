@@ -8,7 +8,7 @@ using CSharpMath.SkiaSharp;
 using SkiaSharp;
 using SkiaSharp.HarfBuzz;
 
-namespace html_to_pdf_aspose.Services;
+namespace HtmlToPdf.Services;
 
 public class FreeHtmlToPdfConverter
 {

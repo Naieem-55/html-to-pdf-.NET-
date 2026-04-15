@@ -1,4 +1,4 @@
-namespace html_to_pdf_aspose.Models
+namespace HtmlToPdf.Models
 {
     public class ErrorViewModel
     {
