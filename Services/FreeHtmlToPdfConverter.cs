@@ -922,6 +922,15 @@ public class LayoutEngine
     private static readonly Regex OversetRegex = new(
         @"\\overset\{([^}]*)\}\{([^}]*)\}", RegexOptions.Compiled);
 
+    // CSharpMath 1.0.0-pre.1 has a matrix column-alignment bug: when two or more
+    // columns both contain cells of different widths (e.g., [44 -1 / -31 1]) the
+    // right-hand content drifts past the column boundary, causing the last column
+    // to overlap the closing delimiter. Padding each row with a trailing empty
+    // cell forces CSharpMath to recompute column widths correctly.
+    private static readonly Regex MatrixEnvRegex = new(
+        @"\\begin\{(bmatrix|pmatrix|vmatrix|Bmatrix|Vmatrix|matrix)\}(.*?)\\end\{\1\}",
+        RegexOptions.Compiled | RegexOptions.Singleline);
+
     internal static string SanitizeLatex(string latex)
     {
         latex = UndersetLimRegex.Replace(latex, @"\lim_{$1}");
@@ -929,7 +938,27 @@ public class LayoutEngine
         latex = OversetRegex.Replace(latex, @"{$2}^{$1}");
         latex = latex.Replace("\\operatorname", "\\mathrm");
         latex = latex.Replace("\\displaystyle", "");
+        latex = PadMatrixColumns(latex);
         return latex;
+    }
+
+    private static string PadMatrixColumns(string latex)
+    {
+        return MatrixEnvRegex.Replace(latex, m =>
+        {
+            var env = m.Groups[1].Value;
+            var body = m.Groups[2].Value;
+            // Split body on \\, the row separator. Append & to each non-empty row.
+            var rows = body.Split(new[] { "\\\\" }, StringSplitOptions.None);
+            for (int i = 0; i < rows.Length; i++)
+            {
+                var row = rows[i];
+                if (!string.IsNullOrWhiteSpace(row))
+                    rows[i] = row + "&";
+            }
+            var newBody = string.Join("\\\\", rows);
+            return $"\\begin{{{env}}}{newBody}\\end{{{env}}}";
+        });
     }
 
     private static readonly Regex LatexPattern = new(
