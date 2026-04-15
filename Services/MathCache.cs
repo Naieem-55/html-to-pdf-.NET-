@@ -77,7 +77,7 @@ public class MathCache
         var bounds = painter.Measure();
         return new MathMeasurement
         {
-            Width = bounds.Width - bounds.X,
+            Width = bounds.Width,
             Height = bounds.Height,
             BoundsX = bounds.X,
             BoundsY = bounds.Y

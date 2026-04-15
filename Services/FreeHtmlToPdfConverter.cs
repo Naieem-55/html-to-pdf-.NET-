@@ -1101,6 +1101,10 @@ public class LayoutEngine
         }
 
         var mathWidth = cached.Width;
+        // CSharpMath bounds.Y is the top-of-ink relative to baseline (negative when ink extends
+        // above baseline, which is the normal case). Height is the full ink box height.
+        var mathAscent = Math.Max(0f, -cached.BoundsY);
+        var mathDescent = Math.Max(0f, cached.Height + cached.BoundsY);
         var mathHeight = Math.Max(cached.Height, style.FontSize * style.LineHeight);
 
         if (!_inInline)
@@ -1118,12 +1122,25 @@ public class LayoutEngine
             _inlineMaxHeight = 0;
         }
 
-        _inlineMaxHeight = Math.Max(_inlineMaxHeight, mathHeight);
+        // When the math starts a line (fresh line or after wrap) and its ascent is taller than
+        // the surrounding font, push box.Y down so the visual top sits at _cursorY instead of
+        // intruding into the line above. Draw uses baseline = box.Y + FontSize, and math top =
+        // baseline - ascent, so box.Y + FontSize - ascent = _cursorY solves to this offset.
+        var atLineStart = _inlineX <= _marginLeft + style.PaddingLeft + 0.5f;
+        var boxY = _cursorY;
+        if (atLineStart && mathAscent > style.FontSize)
+        {
+            boxY = _cursorY + (mathAscent - style.FontSize);
+        }
+
+        // Visual extent from _cursorY down to the math's bottom edge
+        var visualHeight = (boxY - _cursorY) + style.FontSize + mathDescent;
+        _inlineMaxHeight = Math.Max(_inlineMaxHeight, Math.Max(mathHeight, visualHeight));
 
         Boxes.Add(new LayoutBox
         {
             X = _inlineX,
-            Y = _cursorY,
+            Y = boxY,
             Width = mathWidth,
             Height = mathHeight,
             LaTeX = latex,
