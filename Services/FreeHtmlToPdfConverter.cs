@@ -595,19 +595,10 @@ public class LayoutEngine
             case "UL":
             case "OL":
                 FlushInline();
-                // Check if list items use inline-block layout (e.g., .list-group-item)
-                // If so, skip bullet generation and let normal layout handle them
                 if (HasInlineBlockChildren(element))
                 {
-                    _inlineBlockX = _marginLeft;
-                    _inlineBlockRowMaxHeight = 0;
-                    ProcessChildNodes(element, style);
-                    // Flush final inline-block row
-                    if (_inlineBlockX > _marginLeft)
-                    {
-                        _cursorY = _inlineBlockRowY + _inlineBlockRowMaxHeight;
-                        _inlineBlockX = _marginLeft;
-                    }
+                    var columns = DecideColumnCount(element, style);
+                    LayoutAdaptiveInlineBlock(element, style, columns);
                 }
                 else
                     LayoutList(element, style, tagName == "OL");
@@ -826,10 +817,12 @@ public class LayoutEngine
     private float _inlineBlockX;
     private float _inlineBlockRowY;
     private float _inlineBlockRowMaxHeight;
+    private float _inlineBlockWidthOverride; // 0 = use CSS WidthPercent; >0 = override
 
     private void LayoutInlineBlockElement(IElement element, InheritedStyle style)
     {
-        var blockWidth = _contentWidth * style.WidthPercent / 100f;
+        var effectivePercent = _inlineBlockWidthOverride > 0 ? _inlineBlockWidthOverride : style.WidthPercent;
+        var blockWidth = _contentWidth * effectivePercent / 100f;
         var rightEdge = _marginLeft + _contentWidth;
 
         // Wrap to next row if needed
@@ -1360,6 +1353,111 @@ public class LayoutEngine
         if (firstLi == null) return false;
         var liStyle = ResolveStyle(firstLi);
         return liStyle.DisplayInlineBlock && liStyle.WidthPercent > 0;
+    }
+
+    // --- Adaptive inline-block layout (measurement-based column selection) ---
+
+    private int DecideColumnCount(IElement ul, InheritedStyle style)
+    {
+        var items = ul.QuerySelectorAll(":scope > li").ToList();
+        if (items.Count == 0) return 1;
+
+        // Read the .option div's width% from the first item (typically 76%)
+        float optionFraction = 0.76f;
+        var firstOption = ul.QuerySelector(":scope > li .option");
+        if (firstOption != null)
+        {
+            var optStyle = ResolveStyle(firstOption);
+            if (optStyle.WidthPercent > 0)
+                optionFraction = optStyle.WidthPercent / 100f;
+        }
+
+        float maxContentWidth = 0;
+        foreach (var li in items)
+        {
+            var liStyle = ResolveStyle(li);
+            var w = MeasureOptionContentWidth(li, liStyle);
+            if (w > maxContentWidth) maxContentWidth = w;
+        }
+
+        // Only try column counts that evenly divide the item count (e.g., 4→2→1)
+        var columnPadding = 6f;
+        for (int cols = items.Count; cols >= 2; cols--)
+        {
+            if (items.Count % cols != 0) continue; // skip non-even divisions
+            var slotWidth = (_contentWidth / cols) - columnPadding;
+            if (maxContentWidth <= slotWidth * optionFraction)
+                return cols;
+        }
+        return 1;
+    }
+
+    private float MeasureOptionContentWidth(IElement li, InheritedStyle style)
+    {
+        // Measure content width only (the part inside .option div)
+        var optionDiv = li.QuerySelector(".option") ?? li;
+        return MeasureInlineContentWidth(optionDiv, style);
+    }
+
+    private float MeasureInlineContentWidth(IElement element, InheritedStyle style)
+    {
+        float width = 0;
+        foreach (var child in element.ChildNodes)
+        {
+            if (child is IText textNode)
+            {
+                var text = NormalizeWhitespace(textNode.Data);
+                if (string.IsNullOrEmpty(text)) continue;
+                var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (words.Length == 0) continue;
+                var typeface = FontCache.Instance.ResolveForText(text, style.FontFamily, style.Bold, style.Italic);
+                using var font = new SKFont(typeface, style.FontSize);
+                var shaper = FontCache.Instance.GetShaper(typeface);
+                var spaceW = font.MeasureText(" ");
+                foreach (var word in words)
+                {
+                    var shaped = shaper.Shape(word, font);
+                    width += (shaped.Width > 0 ? shaped.Width : font.MeasureText(word)) + spaceW;
+                }
+            }
+            else if (child is IElement childEl)
+            {
+                if (IsMathTexElement(childEl))
+                {
+                    var latex = ExtractLatex(childEl.TextContent);
+                    if (!string.IsNullOrWhiteSpace(latex))
+                    {
+                        var fontSize = _eqFontSize > 0 && _eqFontSize < style.FontSize
+                            ? _eqFontSize : style.FontSize;
+                        var cached = _mathCache.Get(latex, fontSize, false);
+                        // Add render spacing buffer (3pt inline gap + delimiter overshoot)
+                        width += (cached?.Width ?? 0) + 5f;
+                    }
+                }
+                else
+                {
+                    width += MeasureInlineContentWidth(childEl, style);
+                }
+            }
+        }
+        return width;
+    }
+
+    private void LayoutAdaptiveInlineBlock(IElement element, InheritedStyle style, int columns)
+    {
+        _inlineBlockWidthOverride = 100f / columns;
+        _inlineBlockX = _marginLeft;
+        _inlineBlockRowMaxHeight = 0;
+
+        ProcessChildNodes(element, style);
+
+        if (_inlineBlockX > _marginLeft)
+        {
+            _cursorY = _inlineBlockRowY + _inlineBlockRowMaxHeight;
+            _inlineBlockX = _marginLeft;
+        }
+
+        _inlineBlockWidthOverride = 0;
     }
 
     // --- List ---
